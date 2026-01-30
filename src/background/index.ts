@@ -1,26 +1,32 @@
 // Background Service Worker - AI API proxy and state coordination
 
-import type { RuntimeMessage, RuntimeResponse, SceneCensus, LeakReport, Settings } from '../types'
+import type {
+  RuntimeMessage,
+  RuntimeResponse,
+  SceneCensus,
+  LeakReport,
+  Settings,
+  ResourceDescriptor,
+  LeakWarning,
+  UuidLeakCandidate,
+} from '../types'
 import { getStoredSettings, saveSettings, getApiKey } from '../utils/storage'
+import { saveSnapshot, getLastSnapshot } from './snapshot-store'
+import { computeDiff as computeResourceDiff } from './diff-engine'
+import { generateFix } from './ai-copilot'
+import { ANALYSIS_SYSTEM_PROMPT } from './prompts'
 
-const SYSTEM_PROMPT = `你是 Three.js 内存泄漏分析专家。根据提供的对象 Diff 数据，判断哪些对象属于'应该销毁但未销毁'的残留物。忽略 Vue 的内部对象。直接返回泄漏对象的名称列表和简短建议。
 
-返回格式（JSON）：
-{
-  "leaks": ["对象名1", "对象名2"],
-  "severity": "high" | "medium" | "low",
-  "recommendations": ["建议1", "建议2"]
-}`
-
-// Snapshot storage (ephemeral, lost on worker termination)
 let beforeSnapshot: SceneCensus | null = null
 let pendingAnalysis = false
 
-function computeDiff(
+type LegacyDiff = { name: string; before: number; after: number }
+
+function computeLegacyDiff(
   before: SceneCensus,
   after: SceneCensus
-): { name: string; before: number; after: number }[] {
-  const leaked: { name: string; before: number; after: number }[] = []
+): LegacyDiff[] {
+  const leaked: LegacyDiff[] = []
 
   for (const [name, count] of Object.entries(before.objects)) {
     const afterCount = after.objects[name] ?? 0
@@ -29,7 +35,6 @@ function computeDiff(
     }
   }
 
-  // New objects that appeared
   for (const [name, count] of Object.entries(after.objects)) {
     if (!(name in before.objects) && count > 0) {
       leaked.push({ name, before: 0, after: count })
@@ -37,6 +42,43 @@ function computeDiff(
   }
 
   return leaked
+}
+
+async function callOpenAI(
+  settings: Settings,
+  apiKey: string,
+  payload: unknown
+): Promise<string> {
+  const response = await fetch(settings.apiEndpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: settings.model,
+      messages: [
+        { role: 'system', content: ANALYSIS_SYSTEM_PROMPT },
+        { role: 'user', content: JSON.stringify(payload) },
+      ],
+      response_format: { type: 'json_object' },
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`API error: ${response.status}`)
+  }
+
+  const result = await response.json()
+  return result.choices?.[0]?.message?.content ?? ''
+}
+
+function parseAnalysis(content: string): { leaks?: string[]; recommendations?: string[] } {
+  try {
+    return JSON.parse(content)
+  } catch {
+    return {}
+  }
 }
 
 async function analyzeWithAI(
@@ -54,9 +96,7 @@ async function analyzeWithAI(
     }
   }
 
-  const settings = await getStoredSettings()
-  const diff = computeDiff(before, after)
-
+  const diff = computeLegacyDiff(before, after)
   if (diff.length === 0) {
     return {
       event,
@@ -69,29 +109,9 @@ async function analyzeWithAI(
   const payload = { event, leaked_candidates: diff }
 
   try {
-    const response = await fetch(settings.apiEndpoint, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: settings.model,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: JSON.stringify(payload) },
-        ],
-        response_format: { type: 'json_object' },
-      }),
-    })
-
-    if (!response.ok) {
-      throw new Error(`API error: ${response.status}`)
-    }
-
-    const result = await response.json()
-    const content = result.choices?.[0]?.message?.content
-    const analysis = content ? JSON.parse(content) : {}
+    const settings = await getStoredSettings()
+    const content = await callOpenAI(settings, apiKey, payload)
+    const analysis = parseAnalysis(content)
 
     return {
       event,
@@ -109,11 +129,92 @@ async function analyzeWithAI(
   }
 }
 
-// Message handler
+async function handleSnapshotResponse(
+  resources: ResourceDescriptor[],
+  sendResponse: (response: RuntimeResponse) => void
+): Promise<void> {
+  const previous = await getLastSnapshot()
+  await saveSnapshot(resources)
+
+  chrome.runtime.sendMessage({ type: 'RESOURCES_UPDATE', payload: resources })
+
+  if (!previous) {
+    sendResponse({ type: 'OK', payload: null })
+    return
+  }
+
+  const diff = computeResourceDiff(previous.resources, resources)
+  if (diff.leaked.length === 0) {
+    sendResponse({ type: 'OK', payload: null })
+    return
+  }
+
+  const warning: LeakWarning = {
+    type: 'LEAK_DETECTED',
+    timestamp: Date.now(),
+    leaks: diff.leaked,
+  }
+
+  chrome.runtime.sendMessage({ type: 'LEAKS_DETECTED', payload: diff.leaked })
+  await chrome.storage.local.set({ latestLeakWarning: warning })
+  sendResponse({ type: 'OK', payload: null })
+}
+
+async function handleGetSettings(
+  sendResponse: (response: RuntimeResponse) => void
+): Promise<void> {
+  const settings = await getStoredSettings()
+  sendResponse({ type: 'SETTINGS', payload: settings })
+}
+
+async function handleSetApiKey(
+  apiKey: string,
+  sendResponse: (response: RuntimeResponse) => void
+): Promise<void> {
+  await saveSettings({ apiKey })
+  sendResponse({ type: 'OK', payload: null })
+}
+
+async function handleGetApiKey(
+  sendResponse: (response: RuntimeResponse) => void
+): Promise<void> {
+  const apiKey = await getApiKey()
+  sendResponse({ type: 'API_KEY', payload: apiKey })
+}
+
+function handleCensusUpdate(
+  payload: SceneCensus,
+  sendResponse: (response: RuntimeResponse) => void
+): void {
+  if (!beforeSnapshot) {
+    beforeSnapshot = payload
+  }
+  chrome.runtime.sendMessage({ type: 'CENSUS_UPDATE', payload })
+  sendResponse({ type: 'OK', payload: null })
+}
+
+async function handleAnalyzeDiff(
+  payload: { before: SceneCensus; after: SceneCensus; event: string },
+  sendResponse: (response: RuntimeResponse) => void
+): Promise<void> {
+  const report = await analyzeWithAI(payload.before, payload.after, payload.event)
+  chrome.runtime.sendMessage({ type: 'ANALYSIS_RESULT', payload: report })
+  sendResponse({ type: 'ANALYSIS_RESULT', payload: report })
+}
+
+async function handleGenerateFix(
+  payload: { leak: UuidLeakCandidate },
+  sendResponse: (response: RuntimeResponse) => void
+): Promise<void> {
+  const result = await generateFix(payload.leak)
+  chrome.runtime.sendMessage({ type: 'FIX_RESULT', payload: result })
+  sendResponse({ type: 'FIX_RESULT', payload: result })
+}
+
 chrome.runtime.onMessage.addListener(
   (msg: RuntimeMessage, sender, sendResponse: (response: RuntimeResponse) => void) => {
     handleMessage(msg, sendResponse)
-    return true // async response
+    return true
   }
 )
 
@@ -122,42 +223,33 @@ async function handleMessage(
   sendResponse: (response: RuntimeResponse) => void
 ): Promise<void> {
   switch (msg.type) {
-    case 'GET_SETTINGS': {
-      const settings = await getStoredSettings()
-      sendResponse({ type: 'SETTINGS', payload: settings })
+    case 'GET_SETTINGS':
+      await handleGetSettings(sendResponse)
       break
-    }
 
-    case 'SET_API_KEY': {
-      await saveSettings({ apiKey: msg.payload })
-      sendResponse({ type: 'OK', payload: null })
+    case 'SET_API_KEY':
+      await handleSetApiKey(msg.payload, sendResponse)
       break
-    }
 
-    case 'GET_API_KEY': {
-      const apiKey = await getApiKey()
-      sendResponse({ type: 'API_KEY', payload: apiKey })
+    case 'GET_API_KEY':
+      await handleGetApiKey(sendResponse)
       break
-    }
 
-    case 'CENSUS_UPDATE': {
-      // Store latest census for comparison
-      if (!beforeSnapshot) {
-        beforeSnapshot = msg.payload
-      }
-      sendResponse({ type: 'OK', payload: null })
+    case 'CENSUS_UPDATE':
+      handleCensusUpdate(msg.payload, sendResponse)
       break
-    }
 
-    case 'ANALYZE_DIFF': {
-      const report = await analyzeWithAI(
-        msg.payload.before,
-        msg.payload.after,
-        msg.payload.event
-      )
-      sendResponse({ type: 'ANALYSIS_RESULT', payload: report })
+    case 'SNAPSHOT_RESPONSE':
+      await handleSnapshotResponse(msg.payload, sendResponse)
       break
-    }
+
+    case 'ANALYZE_DIFF':
+      await handleAnalyzeDiff(msg.payload, sendResponse)
+      break
+
+    case 'GENERATE_FIX':
+      await handleGenerateFix(msg.payload, sendResponse)
+      break
 
     default:
       sendResponse({ type: 'ERROR', payload: 'Unknown message type' })
@@ -193,5 +285,3 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
     pendingAnalysis = false
   }
 })
-
-console.log('[Leak Hunter] Background service worker started')

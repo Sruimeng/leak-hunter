@@ -1,94 +1,162 @@
 // Inject script - runs in page's Main World
-// Access Three.js renderer and scene
+// Hijacks THREE.js constructors and tracks resource lifecycle
 
-import type { SceneCensus, MemoryMetrics } from '../types/census'
+import type { ResourceDescriptor, ResourceType } from '../types/census'
+import { inspectVueTree } from './vue-inspector'
+import { getSceneCensus, startPolling } from './legacy-census'
 
 declare global {
   interface Window {
-    __THREE_RENDERER__?: THREE.WebGLRenderer
-    __THREE_SCENE__?: THREE.Scene
-    scene?: THREE.Scene
-  }
-  interface Performance {
-    memory?: {
-      usedJSHeapSize: number
-      totalJSHeapSize: number
-      jsHeapSizeLimit: number
-    }
+    THREE?: typeof THREE
   }
 }
 
-// Three.js types (minimal)
 namespace THREE {
   export interface Object3D {
-    type: string
-    name: string
-    traverse(callback: (object: Object3D) => void): void
+    __leak_uuid?: string
   }
-  export interface Scene extends Object3D {}
   export interface WebGLRenderer {
-    info: {
-      memory: {
-        geometries: number
-        textures: number
-      }
+    __leak_uuid?: string
+    dispose?(): void
+  }
+  export interface Texture {
+    __leak_uuid?: string
+    dispose?(): void
+  }
+  export interface BufferGeometry {
+    __leak_uuid?: string
+    dispose?(): void
+  }
+  export interface Material {
+    __leak_uuid?: string
+    dispose?(): void
+  }
+
+  export class WebGLRenderer {}
+  export class Texture {}
+  export class BufferGeometry {}
+  export class Material {}
+}
+
+const registry = new Map<string, ResourceDescriptor>()
+
+const captureStack = (depth = 3): string[] => {
+  const stack = new Error().stack?.split('\n').slice(2, 2 + depth) ?? []
+  return stack.map((line) => line.trim())
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const hijackConstructor = <T extends new (...args: any[]) => object>(
+  target: T,
+  type: ResourceType
+): T => {
+  const original = target
+  return class extends original {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    constructor(...args: any[]) {
+      super(...args)
+      const uuid = crypto.randomUUID()
+      Object.defineProperty(this, '__leak_uuid', {
+        value: uuid,
+        writable: false,
+        enumerable: false,
+      })
+      registry.set(uuid, {
+        uuid,
+        type,
+        timestamp: Date.now(),
+        stack: captureStack(),
+        disposed: false,
+      })
     }
+  } as T
+}
+
+const hijackDispose = <T extends { dispose?: () => void }>(obj: T): void => {
+  if (!obj.dispose) return
+
+  const original = obj.dispose
+  obj.dispose = function (this: T & { __leak_uuid?: string }) {
+    const uuid = this.__leak_uuid
+    if (uuid) {
+      const descriptor = registry.get(uuid)
+      if (descriptor) descriptor.disposed = true
+    }
+    original.call(this)
   }
 }
 
-function getRenderer(): THREE.WebGLRenderer | null {
-  return window.__THREE_RENDERER__ ?? null
+function installHookFor(
+  constructor: unknown,
+  type: ResourceType
+): void {
+  if (!constructor) return
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const hijacked = hijackConstructor(constructor as new (...args: any[]) => object, type)
+  hijackDispose(hijacked.prototype)
+  Object.setPrototypeOf(constructor, hijacked)
 }
 
-function getScene(): THREE.Scene | null {
-  return window.__THREE_SCENE__ ?? window.scene ?? null
-}
+const installHooks = (): void => {
+  if (!window.THREE) return
 
-function getMemoryMetrics(renderer: THREE.WebGLRenderer | null): MemoryMetrics {
-  return {
-    heapUsed: performance.memory?.usedJSHeapSize ?? 0,
-    gpuGeometries: renderer?.info.memory.geometries ?? 0,
-    gpuTextures: renderer?.info.memory.textures ?? 0,
+  const targets: Array<[unknown, ResourceType]> = [
+    [window.THREE.WebGLRenderer, 'WebGLRenderer'],
+    [window.THREE.Texture, 'Texture'],
+    [window.THREE.BufferGeometry, 'BufferGeometry'],
+    [window.THREE.Material, 'Material'],
+  ]
+
+  for (const [constructor, type] of targets) {
+    installHookFor(constructor, type)
   }
 }
 
-function collectObjectCensus(scene: THREE.Scene): Record<string, number> {
-  const objects: Record<string, number> = {}
+// Hijack Vue createApp
+const hijackVue = (): void => {
+  const originalCreateApp = (window as any).Vue?.createApp
+  if (!originalCreateApp) return
 
-  scene.traverse((obj) => {
-    const name = obj.name || 'unnamed'
-    const key = `${obj.type}(${name})`
-    objects[key] = (objects[key] ?? 0) + 1
+  (window as any).Vue.createApp = (...args: unknown[]) => {
+    const app = originalCreateApp(...args)
+    const originalMount = app.mount.bind(app)
+
+    app.mount = (container: string | Element) => {
+      (window as any).__NEXUS_VUE_APP__ = app
+      return originalMount(container)
+    }
+
+    return app
+  }
+}
+
+// Hijack THREE.js via property setter
+const hijackThreeOnLoad = (): void => {
+  let _THREE: unknown = (window as any).THREE
+
+  Object.defineProperty(window, 'THREE', {
+    get: () => _THREE,
+    set: (value) => {
+      _THREE = value
+      if (value) {
+        installHooks()
+      }
+    },
+    configurable: true
   })
-
-  return objects
 }
 
-export function getSceneCensus(): SceneCensus | null {
-  const renderer = getRenderer()
-  const scene = getScene()
-
-  if (!scene) return null
+const getSnapshotData = () => {
+  const resources = Array.from(registry.values())
+  const vue = inspectVueTree()
 
   return {
     timestamp: Date.now(),
-    memory: getMemoryMetrics(renderer),
-    objects: collectObjectCensus(scene),
+    resources,
+    vue,
   }
 }
 
-function postCensus(census: SceneCensus): void {
-  window.postMessage({ type: 'LEAK_HUNTER_CENSUS', payload: census }, '*')
-}
-
-function startPolling(intervalMs: number): void {
-  setInterval(() => {
-    const census = getSceneCensus()
-    if (census) postCensus(census)
-  }, intervalMs)
-}
-
-// Listen for commands from content script
 window.addEventListener('message', (e) => {
   if (e.source !== window) return
   if (e.data?.type !== 'LEAK_HUNTER_COMMAND') return
@@ -101,9 +169,25 @@ window.addEventListener('message', (e) => {
       window.postMessage({ type: 'LEAK_HUNTER_SNAPSHOT', payload: census }, '*')
     }
   }
+
+  if (command === 'SNAPSHOT_REQUEST') {
+    performance.mark('snapshot-start')
+    const data = getSnapshotData()
+    window.postMessage({ type: 'SNAPSHOT_RESPONSE', data }, '*')
+    performance.mark('snapshot-end')
+  }
 })
 
-// Start 1Hz polling
-startPolling(1000)
+// Initialize: hijack before DOM loads
+hijackVue()
+hijackThreeOnLoad()
 
-console.log('[Leak Hunter] Inject script loaded')
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => {
+    installHooks()
+    startPolling(1000)
+  })
+} else {
+  installHooks()
+  startPolling(1000)
+}

@@ -14,14 +14,18 @@ export default defineConfig({
       '@': resolve(__dirname, 'src'),
     },
   },
+  base: './',
   build: {
     rollupOptions: {
       input: {
         inject: resolve(__dirname, 'src/inject/index.ts'),
+        panel: resolve(__dirname, 'src/panel/index.html'),
+        'panel-bundle': resolve(__dirname, 'src/panel/main.ts'),
       },
       output: {
         entryFileNames: (chunk) => {
           if (chunk.name === 'inject') return 'assets/inject.js'
+          if (chunk.name === 'panel-bundle') return 'assets/panel.js'
           return 'assets/[name]-[hash].js'
         },
       },

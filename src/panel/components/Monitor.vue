@@ -11,10 +11,21 @@ const latest = computed(() => props.history[props.history.length - 1])
 const heapData = computed(() => props.history.map(c => c.memory.heapUsed / 1024 / 1024))
 const geoData = computed(() => props.history.map(c => c.memory.gpuGeometries))
 const texData = computed(() => props.history.map(c => c.memory.gpuTextures))
+const vueData = computed(() => props.history.map(c => countVueComponents(c.vue)))
 
 const maxHeap = computed(() => Math.max(...heapData.value, 1))
 const maxGeo = computed(() => Math.max(...geoData.value, 1))
 const maxTex = computed(() => Math.max(...texData.value, 1))
+const maxVue = computed(() => Math.max(...vueData.value, 1))
+
+function countVueComponents(tree: typeof props.history[0]['vue']): number {
+  if (!tree) return 0
+  let count = 1
+  tree.children.forEach(child => {
+    count += countVueComponents(child)
+  })
+  return count
+}
 
 function toPath(data: number[], max: number): string {
   if (data.length === 0) return ''
@@ -67,6 +78,16 @@ function formatBytes(bytes: number): string {
       </div>
       <svg class="chart" viewBox="0 0 280 40">
         <path :d="toPath(texData, maxTex)" class="line line-tex" />
+      </svg>
+    </div>
+
+    <div class="metric">
+      <div class="metric-header">
+        <span class="metric-label">Vue Components</span>
+        <span class="metric-value">{{ vueData[vueData.length - 1] || '-' }}</span>
+      </div>
+      <svg class="chart" viewBox="0 0 280 40">
+        <path :d="toPath(vueData, maxVue)" class="line line-vue" />
       </svg>
     </div>
   </div>
@@ -127,5 +148,9 @@ function formatBytes(bytes: number): string {
 
 .line-tex {
   stroke: #f59e0b;
+}
+
+.line-vue {
+  stroke: #06b6d4;
 }
 </style>

@@ -2,15 +2,27 @@
 import { ref, computed } from 'vue'
 import Monitor from './components/Monitor.vue'
 import Report from './components/Report.vue'
-import type { SceneCensus, LeakReport } from '../types'
+import ResourceTable from './components/ResourceTable.vue'
+import LeakDetail from './components/LeakDetail.vue'
+import FixPanel from './components/FixPanel.vue'
+import type { SceneCensus, LeakReport, ResourceDescriptor, UuidLeakCandidate, FixResult } from '../types'
 
 const isMinimized = ref(false)
 const isDragging = ref(false)
-const position = ref({ x: 20, y: 20 })
-const dragOffset = ref({ x: 0, y: 0 })
+const dragStart = ref({ x: 0, y: 0 })
+const iframePos = ref({ x: 0, y: 0 })
+const activeTab = ref<'monitor' | 'resources' | 'leaks'>('monitor')
+const isRecording = ref(false)
+const aiInterceptEnabled = ref(false)
+const snapshotProgress = ref(false)
 
 const censusHistory = ref<SceneCensus[]>([])
 const latestReport = ref<LeakReport | null>(null)
+const resources = ref<ResourceDescriptor[]>([])
+const leaks = ref<UuidLeakCandidate[]>([])
+const selectedLeak = ref<ResourceDescriptor | null>(null)
+const fixResult = ref<FixResult | null>(null)
+const fixLoading = ref(false)
 
 const isLeaking = computed(() => {
   if (censusHistory.value.length < 10) return false
@@ -19,6 +31,18 @@ const isLeaking = computed(() => {
     if (recent[i]!.memory.heapUsed <= recent[i - 1]!.memory.heapUsed) return false
   }
   return true
+})
+
+const leakCount = computed(() => leaks.value.length)
+
+const vramUsageMB = computed(() => {
+  if (!censusHistory.value.length) return 0
+  const latest = censusHistory.value.at(-1)!
+  return ((latest.memory.gpuGeometries + latest.memory.gpuTextures) * 1024) / 1024
+})
+
+const showWarning = computed(() => {
+  return leakCount.value > 50 || vramUsageMB.value > 500
 })
 
 function handleCensus(census: SceneCensus): void {
@@ -32,20 +56,25 @@ function handleReport(report: LeakReport): void {
   latestReport.value = report
 }
 
+function handleResources(newResources: ResourceDescriptor[]): void {
+  resources.value = newResources
+}
+
+function handleLeaks(newLeaks: UuidLeakCandidate[]): void {
+  leaks.value = newLeaks
+}
+
 function startDrag(e: MouseEvent): void {
   isDragging.value = true
-  dragOffset.value = {
-    x: e.clientX - position.value.x,
-    y: e.clientY - position.value.y,
-  }
+  dragStart.value = { x: e.screenX, y: e.screenY }
+  window.parent.postMessage({ type: 'LEAK_HUNTER_DRAG_START' }, '*')
 }
 
 function onDrag(e: MouseEvent): void {
   if (!isDragging.value) return
-  position.value = {
-    x: e.clientX - dragOffset.value.x,
-    y: e.clientY - dragOffset.value.y,
-  }
+  const dx = e.screenX - dragStart.value.x
+  const dy = e.screenY - dragStart.value.y
+  window.parent.postMessage({ type: 'LEAK_HUNTER_DRAG_MOVE', dx, dy }, '*')
 }
 
 function endDrag(): void {
@@ -54,15 +83,64 @@ function endDrag(): void {
 
 function toggleMinimize(): void {
   isMinimized.value = !isMinimized.value
+  window.parent.postMessage({
+    type: isMinimized.value ? 'LEAK_HUNTER_MINIMIZE' : 'LEAK_HUNTER_RESTORE'
+  }, '*')
 }
 
-// Listen for messages from content script
-window.addEventListener('message', (e) => {
-  if (e.data?.type === 'LEAK_HUNTER_CENSUS') {
-    handleCensus(e.data.payload)
+function toggleRecording(): void {
+  isRecording.value = !isRecording.value
+  chrome.runtime.sendMessage({ type: isRecording.value ? 'START_RECORDING' : 'STOP_RECORDING' })
+}
+
+function takeSnapshot(): void {
+  snapshotProgress.value = true
+  chrome.runtime.sendMessage({ type: 'TAKE_SNAPSHOT' })
+
+  setTimeout(() => {
+    snapshotProgress.value = false
+  }, 3000)
+}
+
+function selectResource(resource: ResourceDescriptor): void {
+  selectedLeak.value = resource
+  activeTab.value = 'leaks'
+}
+
+async function generateFix(resource: ResourceDescriptor): Promise<void> {
+  fixLoading.value = true
+  fixResult.value = null
+
+  const leak: UuidLeakCandidate = {
+    uuid: resource.uuid,
+    age: Date.now() - resource.timestamp,
+    descriptor: resource,
+    component: resource.component
   }
-  if (e.data?.type === 'ANALYSIS_RESULT') {
-    handleReport(e.data.payload)
+
+  chrome.runtime.sendMessage({ type: 'GENERATE_FIX', payload: { leak } })
+}
+
+function handleFixResult(result: FixResult): void {
+  fixResult.value = result
+  fixLoading.value = false
+}
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === 'CENSUS_UPDATE') {
+    handleCensus(msg.payload)
+  }
+  if (msg.type === 'ANALYSIS_RESULT') {
+    handleReport(msg.payload)
+  }
+  if (msg.type === 'RESOURCES_UPDATE') {
+    handleResources(msg.payload)
+  }
+  if (msg.type === 'LEAKS_DETECTED') {
+    handleLeaks(msg.payload)
+  }
+  if (msg.type === 'FIX_RESULT') {
+    handleFixResult(msg.payload)
   }
 })
 </script>
@@ -70,8 +148,7 @@ window.addEventListener('message', (e) => {
 <template>
   <div
     class="panel"
-    :class="{ minimized: isMinimized, leaking: isLeaking }"
-    :style="{ left: `${position.x}px`, top: `${position.y}px` }"
+    :class="{ minimized: isMinimized, leaking: isLeaking, warning: showWarning }"
     @mousemove="onDrag"
     @mouseup="endDrag"
     @mouseleave="endDrag"
@@ -80,6 +157,9 @@ window.addEventListener('message', (e) => {
       <span class="title">
         <span class="icon">🔍</span>
         Leak Hunter
+        <span v-if="leakCount > 0" class="badge badge-leak-count">
+          {{ leakCount }}
+        </span>
       </span>
       <div class="controls">
         <span v-if="isLeaking" class="badge badge-danger">LEAKING</span>
@@ -90,30 +170,104 @@ window.addEventListener('message', (e) => {
     </header>
 
     <div v-if="!isMinimized" class="content">
-      <Monitor :history="censusHistory" />
-      <Report v-if="latestReport" :report="latestReport" />
+      <div v-if="showWarning" class="warning-banner">
+        ⚠️ Critical: {{ leakCount > 50 ? `${leakCount} objects leaked` : `${vramUsageMB.toFixed(0)}MB VRAM used` }}
+      </div>
+
+      <div class="toolbar">
+        <button
+          :class="['btn-toolbar', { active: isRecording }]"
+          @click="toggleRecording"
+        >
+          {{ isRecording ? '⏹ Stop' : '⏺ Record' }}
+        </button>
+        <button
+          class="btn-toolbar"
+          :disabled="snapshotProgress"
+          @click="takeSnapshot"
+        >
+          {{ snapshotProgress ? '⏳' : '📸' }} Snapshot
+        </button>
+        <label class="switch">
+          <input
+            v-model="aiInterceptEnabled"
+            type="checkbox"
+          >
+          <span class="slider"></span>
+          <span class="switch-label">AI 拦截</span>
+        </label>
+      </div>
+
+      <nav class="tabs">
+        <button
+          :class="['tab', { active: activeTab === 'monitor' }]"
+          @click="activeTab = 'monitor'"
+        >
+          Monitor
+        </button>
+        <button
+          :class="['tab', { active: activeTab === 'resources' }]"
+          @click="activeTab = 'resources'"
+        >
+          Resources
+        </button>
+        <button
+          :class="['tab', { active: activeTab === 'leaks' }]"
+          @click="activeTab = 'leaks'"
+        >
+          Leaks
+        </button>
+      </nav>
+
+      <div class="tab-content">
+        <div v-show="activeTab === 'monitor'">
+          <Monitor :history="censusHistory" />
+          <Report v-if="latestReport" :report="latestReport" />
+        </div>
+
+        <div v-show="activeTab === 'resources'">
+          <ResourceTable
+            :resources="resources"
+            @select="selectResource"
+          />
+        </div>
+
+        <div v-show="activeTab === 'leaks'" class="leak-view">
+          <LeakDetail
+            v-if="selectedLeak"
+            :resource="selectedLeak"
+            @generate-fix="generateFix"
+          />
+          <FixPanel
+            :result="fixResult"
+            :loading="fixLoading"
+          />
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
 .panel {
-  position: fixed;
-  width: 320px;
-  background: rgba(26, 26, 46, 0.95);
-  border: 1px solid #333;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: rgba(26, 26, 46, 0.98);
   border-radius: 8px;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
   color: #eee;
   font-size: 13px;
-  z-index: 999999;
-  backdrop-filter: blur(8px);
   transition: border-color 0.3s;
+  overflow: hidden;
 }
 
 .panel.leaking {
   border-color: #ef4444;
   animation: pulse 1s infinite;
+}
+
+.panel.warning {
+  border-color: #f59e0b;
 }
 
 @keyframes pulse {
@@ -169,6 +323,17 @@ window.addEventListener('message', (e) => {
   color: white;
 }
 
+.badge-leak-count {
+  background: #ef4444;
+  color: white;
+  animation: pulse-badge 1s infinite;
+}
+
+@keyframes pulse-badge {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
 .btn-icon {
   width: 24px;
   height: 24px;
@@ -188,7 +353,147 @@ window.addEventListener('message', (e) => {
 
 .content {
   padding: 12px;
-  max-height: 400px;
+  max-height: 500px;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.warning-banner {
+  padding: 8px 12px;
+  background: rgba(245, 158, 11, 0.2);
+  border: 1px solid #f59e0b;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #fbbf24;
+  font-weight: 600;
+  text-align: center;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+}
+
+.btn-toolbar {
+  padding: 6px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  color: #eee;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-toolbar:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.btn-toolbar:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-toolbar.active {
+  background: #ef4444;
+  border-color: #ef4444;
+}
+
+.switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  cursor: pointer;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+}
+
+.slider {
+  position: relative;
+  width: 32px;
+  height: 16px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  transition: background 0.2s;
+}
+
+.slider::before {
+  content: '';
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  left: 2px;
+  top: 2px;
+  background: white;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.switch input:checked + .slider {
+  background: #4f46e5;
+}
+
+.switch input:checked + .slider::before {
+  transform: translateX(16px);
+}
+
+.switch-label {
+  font-size: 11px;
+  color: #eee;
+  font-weight: 600;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 4px;
+  border-radius: 6px;
+}
+
+.tab {
+  flex: 1;
+  padding: 6px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: #888;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.tab:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: #eee;
+}
+
+.tab.active {
+  background: #4f46e5;
+  color: white;
+}
+
+.tab-content {
+  min-height: 200px;
+}
+
+.leak-view {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 </style>

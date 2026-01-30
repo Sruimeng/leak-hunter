@@ -1,16 +1,20 @@
-import type { SceneCensus, LeakCandidate, LeakReport } from './census'
+import type { SceneCensus, LeakCandidate, LeakReport, ResourceDescriptor, UuidLeakCandidate } from './census'
+import type { FixResult } from './ai'
 
 // Message types for Inject -> Content (postMessage)
 export type InjectMessage =
   | { type: 'LEAK_HUNTER_CENSUS'; payload: SceneCensus }
   | { type: 'LEAK_HUNTER_SNAPSHOT'; payload: SceneCensus }
+  | { type: 'LEAK_HUNTER_SNAPSHOT_RESPONSE'; payload: ResourceDescriptor[] }
   | { type: 'LEAK_HUNTER_ERROR'; payload: string }
 
 // Message types for Content -> Background (chrome.runtime.sendMessage)
 export type RuntimeMessage =
   | { type: 'CENSUS_UPDATE'; payload: SceneCensus }
+  | { type: 'SNAPSHOT_RESPONSE'; payload: ResourceDescriptor[] }
   | { type: 'TAKE_SNAPSHOT'; payload: null }
   | { type: 'ANALYZE_DIFF'; payload: { before: SceneCensus; after: SceneCensus; event: string } }
+  | { type: 'GENERATE_FIX'; payload: { leak: UuidLeakCandidate } }
   | { type: 'GET_API_KEY'; payload: null }
   | { type: 'SET_API_KEY'; payload: string }
   | { type: 'GET_SETTINGS'; payload: null }
@@ -18,6 +22,7 @@ export type RuntimeMessage =
 // Response types from Background
 export type RuntimeResponse =
   | { type: 'ANALYSIS_RESULT'; payload: LeakReport }
+  | { type: 'FIX_RESULT'; payload: FixResult }
   | { type: 'API_KEY'; payload: string | null }
   | { type: 'SETTINGS'; payload: Settings }
   | { type: 'ERROR'; payload: string }
